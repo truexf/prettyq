@@ -11,7 +11,7 @@ prettyQ是一个消息队列，参考了kafka的设计， 100%由golang实现，
 * 消费确认：不支持。由于消息是持久化和多副本存储的，因此系统尽力保证经过投递确认的消息会被持久化不丢失，但这不是绝对的
 
 ### prettyQ的架构
-![image]()
+![image](https://github.com/truexf/prettyq/blob/master/prettyq_arc.png)
 * prettyQ的pruducer/server, consumer/server之间的通信实现采用iip通信框架(https://github.com/truexf/iip)
 * prettyQ的消息逻辑上按照topic分组，同一个topic的消息物理上分为多个连续的partition, 同一个partition包含的多个消息文件及索引，每个消息文件的容量相同，当一个消息文件写满，则写入下一个消息文件。
 * 消息文件分为数据文件和索引文件：扩展名为.data的是消息文件，扩展名为.idx的是消息文件对应的稀疏索引文件，索引的key是messageNum, 每条message都有一个唯一num号

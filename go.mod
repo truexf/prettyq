@@ -18,6 +18,7 @@ require (
 	github.com/grpc-ecosystem/go-grpc-prometheus v1.2.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway v1.14.5 // indirect
 	github.com/prometheus/client_golang v1.11.0 // indirect
+	github.com/truexf/goutil v1.2.3 // indirect
 	go.etcd.io/etcd v3.3.25+incompatible
 	go.etcd.io/etcd/client/pkg/v3 v3.5.0 // indirect
 	golang.org/x/lint v0.0.0-20210508222113-6edffad5e616 // indirect

@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"math/rand"
 	"os"
 	"strconv"
 	"strings"
@@ -40,5 +41,26 @@ func TestMessageFile(t *testing.T) {
 			t.Fatalf("not equal, %s, %d", string(ret.Message.Data), i)
 		}
 		// fmt.Printf("message pos: %d, ok\n", i)
+	}
+}
+
+func BenchmarkQuery(t *testing.B) {
+	c := make(chan *protocol.MessageQueryResult, 2)
+	pool := NewIndexPool()
+	pool.RegisterTopicDataPath("test-topic", "/tmp/prettyq/storage")
+	for i := 0; i < t.N; i++ {
+		n := rand.Intn(1234)
+		q := &protocol.MessageQuery{Topic: "test-topic",
+			MessagePos: uint64(n),
+			Limit:      1,
+			Result:     c}
+		pool.Query(q)
+		ret := <-q.Result
+		if ret.Error != nil {
+			t.Fatalf(ret.Error.Error())
+		}
+		if string(ret.Message.Data) != strings.Repeat("testmessage", 1000)+strconv.Itoa(n) {
+			t.Fatalf("not equal, %s, %d", string(ret.Message.Data), n)
+		}
 	}
 }

@@ -7,4 +7,6 @@ var (
 	ErrorMsgInvalidMessageFile  = "invalid message file content"
 	ErrCodeQueueLimit           = 102
 	ErrorMsgQueueLimit          = "queue capacity is limit"
+	ErrCodeMsgSizeTooLarge      = 103
+	ErrMsgMsgSizeTooLarge       = "message size too large"
 )

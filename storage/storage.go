@@ -5,7 +5,6 @@
 package storage
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/binary"
 	"fmt"
@@ -24,31 +23,33 @@ import (
 
 // MessageFile代表一个topic的数据文件，storage engine通过其实现对数据文件的读写
 type MessageFile struct {
-	filePath            string     //文件所在目录
-	topic               string     //topic
-	messagePos          uint32     //文件中第一条消息的消息序号
-	fileMaxSize         uint32     //文件最大尺寸
-	fd                  *os.File   //文件读写句柄
-	currentFileSize     int64      //当前文件实际尺寸
+	filePath            string   //文件所在目录
+	topic               string   //topic
+	messagePos          uint64   //当前消息序号
+	fileMaxSize         uint32   //文件最大尺寸
+	fd                  *os.File //文件读写句柄
+	currentFileSize     int64    //当前文件实际尺寸
+	latestMessageSize   int64
 	currentfullFileName string     //全路径文件名
 	idxFile             *IndexFile //对应的索引文件
 }
 
 // IndexFile代表一个MessageFile对应的索引文件，索引文件与数据文件是一一对应的
 type IndexFile struct {
-	filePath                string   //文件所在目录
-	topic                   string   //topic
-	currentfullFileName     string   //全路径文件名
-	messagePos              uint32   //文件中第一条索引的消息序号（索引的key）
-	latestIndexedMessagePos uint32   //文件中最后一条索引的消息序号
+	filePath                string //文件所在目录
+	topic                   string //topic
+	currentfullFileName     string //全路径文件名
+	messagePos              uint64 //当前消息序号
+	messageFile             *MessageFile
+	latestIndexedMessagePos uint64   //文件中写入最后一条索引的消息序号，由于是稀疏索引，因此不是每一条消息都建立索引
 	fd                      *os.File //文件读写句柄
 }
 
-func newIndexFile(filePath string, topic string) (*IndexFile, error) {
-	ret := &IndexFile{filePath: filePath, topic: topic}
+func newIndexFile(filePath string, topic string, messagePos uint64) (*IndexFile, error) {
+	ret := &IndexFile{filePath: filePath, topic: topic, messagePos: messagePos}
 	ret.currentfullFileName = ret.nextFileName()
 	var err error
-	ret.fd, err = os.OpenFile(ret.currentfullFileName, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
+	ret.fd, err = os.OpenFile(ret.currentfullFileName, os.O_TRUNC|os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
 		return nil, fmt.Errorf("open file %s fail, %s", ret.currentfullFileName, err.Error())
 	}
@@ -56,81 +57,104 @@ func newIndexFile(filePath string, topic string) (*IndexFile, error) {
 }
 
 func (m *IndexFile) nextFileName() string {
-	fn := fmt.Sprintf("%s_%d.idx", m.topic, m.messagePos)
+	idx := m.messagePos
+	if idx != 0 {
+		idx++
+	}
+	fn := fmt.Sprintf("%s_%06d.idx", m.topic, idx)
 	return filepath.Join(m.filePath, fn)
 }
 
-func (m *IndexFile) writeIndex(messagePos uint32, filePos int64) error {
-	m.messagePos = messagePos
-	if m.messagePos-m.latestIndexedMessagePos >= 10 {
+func (m *IndexFile) writeIndex(messagePos uint64, filePos int64, force bool) error {
+	if force || m.messagePos == 0 || messagePos-m.latestIndexedMessagePos >= 30 {
 		rec := fmt.Sprintf("%d:%d\n", messagePos, filePos)
 		m.fd.WriteString(rec)
+		m.latestIndexedMessagePos = messagePos
 	}
+	m.messagePos = messagePos
 	return nil
 }
 
 func (m *IndexFile) Close() {
+	// write latest message index before close
+	m.writeIndex(m.messagePos, m.messageFile.currentFileSize-m.messageFile.latestMessageSize, true)
 	m.fd.Close()
 }
 
-func NewMessageFile(filePath string, topic string, startMessagePos uint32, maxSize uint32) (*MessageFile, error) {
+func NewMessageFile(filePath string, topic string, startMessagePos uint64, maxSize uint32) (*MessageFile, error) {
 	ret := &MessageFile{filePath: filePath, topic: topic, messagePos: startMessagePos, fileMaxSize: maxSize}
 	ret.currentfullFileName = ret.nextFileName()
 	var err error
-	ret.fd, err = os.OpenFile(ret.currentfullFileName, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
+	ret.fd, err = os.OpenFile(ret.currentfullFileName, os.O_TRUNC|os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
 		return nil, fmt.Errorf("open file %s fail, %s", ret.currentfullFileName, err.Error())
 	}
-	if ret.idxFile, err = newIndexFile(filePath, topic); err != nil {
+	if ret.idxFile, err = newIndexFile(filePath, topic, startMessagePos); err != nil {
 		return nil, err
 	}
+	ret.idxFile.messageFile = ret
 
 	return ret, nil
 }
 
 func (m *MessageFile) nextFileName() string {
-	fn := fmt.Sprintf("%s_%d.data", m.topic, m.messagePos)
+	idx := m.messagePos
+	if idx != 0 {
+		idx++
+	}
+	fn := fmt.Sprintf("%s_%06d.data", m.topic, idx)
 	return filepath.Join(m.filePath, fn)
 }
 
 func (m *MessageFile) WriteMessage(msg *protocol.MessageStorage) error {
+	if (msg.Num > 0 && msg.Num <= m.messagePos) || msg.Num < m.messagePos {
+		return fmt.Errorf("message.num invalid, current: %d, to write: %d", m.messagePos, msg.Num)
+	}
 	bts := make([]byte, 16+msg.Size)
+	// msg.num
 	binary.BigEndian.PutUint64(bts, msg.Num)
+	// msg.size
 	binary.BigEndian.PutUint32(bts[8:], msg.Size)
+	// msg.data
 	copy(bts[12:], msg.Data)
+	// msg.crc
 	binary.BigEndian.PutUint32(bts[12+len(msg.Data):], msg.Crc)
+	// msg.tailsize
 	binary.BigEndian.PutUint32(bts[12+len(msg.Data)+4:], msg.Size)
 	if _, err := m.fd.Write(bts); err != nil {
 		return err
 	}
+	m.latestMessageSize = int64(len(bts))
 	m.currentFileSize += int64(len(bts))
-	m.messagePos++
+	m.messagePos = msg.Num
 
 	// write index
-	if err := m.idxFile.writeIndex(m.messagePos, m.currentFileSize); err != nil {
+	if err := m.idxFile.writeIndex(msg.Num, m.currentFileSize-int64(len(bts)), false); err != nil {
 		return err
 	}
 
 	// create new file if file size exceed
 	if m.currentFileSize >= int64(m.fileMaxSize) {
-		m.fd.Close()
 		m.idxFile.Close()
+		m.fd.Close()
 		m.currentfullFileName = m.nextFileName()
 		var err error
-		m.fd, err = os.OpenFile(m.currentfullFileName, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
+		m.fd, err = os.OpenFile(m.currentfullFileName, os.O_TRUNC|os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
 		if err != nil {
 			return fmt.Errorf("open file %s fail, %s", m.currentfullFileName, err.Error())
 		}
-		if m.idxFile, err = newIndexFile(m.filePath, m.topic); err != nil {
+		if m.idxFile, err = newIndexFile(m.filePath, m.topic, m.messagePos); err != nil {
 			return err
 		}
+		m.idxFile.messageFile = m
+		m.currentFileSize = 0
 	}
 	return nil
 }
 
 func (m *MessageFile) Close() {
-	m.fd.Close()
 	m.idxFile.Close()
+	m.fd.Close()
 }
 
 type MessageIndexRec struct {
@@ -161,7 +185,7 @@ func newMessageIndexFromFile(idxFile string) (*MessageIndex, error) {
 	if !strings.HasSuffix(idxFile, ".idx") {
 		return nil, fmt.Errorf("file name %s not has suffix .idx", idxFile)
 	}
-	fn := strings.TrimSuffix(idxFile, ".idx")
+	fn := filepath.Base(strings.TrimSuffix(idxFile, ".idx"))
 	fnParts := strings.Split(fn, "_")
 	if len(fnParts) != 2 {
 		return nil, fmt.Errorf("invalid index file name %s", idxFile)
@@ -175,7 +199,7 @@ func newMessageIndexFromFile(idxFile string) (*MessageIndex, error) {
 		return nil, err
 	}
 	lines := bytes.Split(bts, []byte("\n"))
-	ret := &MessageIndex{topic: fnParts[0], data: make([]MessageIndexRec, 0, len(lines))}
+	ret := &MessageIndex{topic: fnParts[0], indexFile: idxFile, data: make([]MessageIndexRec, 0, len(lines))}
 	for _, v := range lines {
 		if len(v) == 0 {
 			continue
@@ -193,11 +217,13 @@ func newMessageIndexFromFile(idxFile string) (*MessageIndex, error) {
 			continue
 		}
 		ret.data = append(ret.data, MessageIndexRec{MessagePos: msgPos, FilePos: filePos})
+		ret.stopMessagePos = msgPos + 1
 	}
-	sort.Sort(ret)
+	// sort.Sort(ret)
 	return ret, nil
 }
 
+// 用于消息向文件写入的同时也向缓存写入一份
 func (m *MessageIndex) AppendIndexRec(rec MessageIndexRec) error {
 	m.Lock()
 	defer m.Unlock()
@@ -205,28 +231,31 @@ func (m *MessageIndex) AppendIndexRec(rec MessageIndexRec) error {
 		return fmt.Errorf("mesasge index is too old")
 	}
 	m.data = append(m.data, rec)
-	if m.startMessagePos == 0 {
+	if len(m.data) == 1 {
 		m.startMessagePos = rec.MessagePos
 		m.indexFile = fmt.Sprintf("%s_%d.idx", m.topic, rec.MessagePos)
 	}
+	m.stopMessagePos = rec.MessagePos + 1
 	return nil
 }
 
 func (m *MessageIndex) Find(messagePos uint64) *MessageIndexRec {
 	m.RLock()
 	defer m.RUnlock()
-
-	idx := sort.Search(len(m.data), func(i int) bool {
-		if len(m.data) == 0 || messagePos >= m.stopMessagePos {
-			return false
-		}
-		return (len(m.data) == i+1 && m.data[i].MessagePos >= messagePos) ||
-			(len(m.data) > i+1 && m.data[i].MessagePos <= messagePos && m.data[i+1].MessagePos >= messagePos)
-	})
-	if idx == len(m.data) {
+	if len(m.data) == 0 {
 		return nil
 	}
-	return &m.data[idx]
+
+	idx := sort.Search(len(m.data), func(i int) bool {
+		return m.data[i].MessagePos > messagePos
+	})
+	if idx == len(m.data) {
+		return &m.data[len(m.data)-1]
+	} else if idx == 0 {
+		return nil
+	} else {
+		return &m.data[idx-1]
+	}
 }
 
 // 一个topic的索引文件集，data式一个顺序排列的索引文件cache
@@ -250,12 +279,9 @@ func newMessageIndexes(topic string) *MessageIndexes {
 
 func (m *MessageIndexes) AddIndex(idx *MessageIndex) {
 	m.Lock()
-	defer m.RLock()
+	defer m.Unlock()
 	i := sort.Search(len(m.data), func(i int) bool {
-		if i == len(m.data)-1 {
-			return m.data[i].indexFile == idx.indexFile
-		}
-		return m.data[i].indexFile <= idx.indexFile && m.data[i+1].indexFile >= idx.indexFile
+		return m.data[i].indexFile >= idx.indexFile
 	})
 	if i == len(m.data) {
 		m.data = append(m.data, idx)
@@ -267,6 +293,7 @@ func (m *MessageIndexes) AddIndex(idx *MessageIndex) {
 	}
 }
 
+// 用于消息向文件写入的同时也向缓存写入一份
 func (m *MessageIndexes) AppendIndexRec(rec MessageIndexRec) error {
 	idx := m.Find(rec.MessagePos)
 	if idx == nil {
@@ -289,12 +316,16 @@ func (m *MessageIndexes) Find(messagePos uint64) *MessageIndex {
 	defer m.RUnlock()
 
 	foundIdx := sort.Search(len(m.data), func(i int) bool {
-		return m.data[i].startMessagePos <= messagePos && m.data[i].stopMessagePos > messagePos
+		return m.data[i].stopMessagePos > messagePos
+		//return m.data[i].startMessagePos <= messagePos && m.data[i].stopMessagePos > messagePos
 	})
 	if foundIdx == len(m.data) {
 		return nil
 	}
-	return m.data[foundIdx]
+	if m.data[foundIdx].startMessagePos <= messagePos {
+		return m.data[foundIdx]
+	}
+	return nil
 }
 
 // 索引缓存池。
@@ -305,6 +336,10 @@ type IndexPool struct {
 	pathLock sync.RWMutex
 	data     map[string]*MessageIndexes //key: topic
 	sync.RWMutex
+}
+
+func NewIndexPool() *IndexPool {
+	return &IndexPool{dataPath: make(map[string]string), data: make(map[string]*MessageIndexes)}
 }
 
 func (m *IndexPool) RegisterTopicDataPath(topic, path string) {
@@ -359,7 +394,13 @@ func (m *IndexPool) findPoolIndex(topic string, messagePos uint64) (ret bool, me
 	if rec == nil {
 		return false, "", -1
 	}
-	return true, idx.indexFile, rec.FilePos
+	fn := idx.indexFile
+	if len(fn) > 4 && fn[len(fn)-4:] == ".idx" {
+		fn = fn[:len(fn)-4] + ".data"
+	} else {
+		panic(fmt.Sprintf("invalid index file: %s", fn))
+	}
+	return true, fn, rec.FilePos
 }
 
 func (m *IndexPool) findStorageIndex(topic string, messagePos uint64) (string, error) {
@@ -377,16 +418,17 @@ func (m *IndexPool) findStorageIndex(topic string, messagePos uint64) (string, e
 	}
 	if len(fnList) > 0 {
 		sort.Strings(fnList)
-		fn := fmt.Sprintf("%s_%d.idx", topic, messagePos)
+		fn := fmt.Sprintf("%s_%06d.idx", topic, messagePos)
 		if n := sort.Search(len(fnList), func(i int) bool {
-			if i == len(fnList)-1 {
-				return fnList[i] <= fn
-			}
-			return fnList[i] <= fn && fnList[i] >= fn
+			return fnList[i] >= fn
 		}); n == len(fnList) {
 			return fnList[len(fnList)-1], nil
 		} else {
-			return fnList[n], nil
+			if fnList[n] == fn {
+				return fnList[n], nil
+			} else if n > 0 {
+				return fnList[n-1], nil
+			}
 		}
 	}
 	return "", nil
@@ -407,7 +449,7 @@ func (m *IndexPool) loadIndex(topic string, indexFile string) error {
 	return nil
 }
 
-func (m *IndexPool) ReadMessagesFromFile(fn string, filePos int64, limit int) ([]*protocol.MessageConsumer, error) {
+func (m *IndexPool) ReadMessagesFromFile(fn string, filePos int64, beginMessagePos, endMessagePos uint64) ([]*protocol.MessageConsumer, error) {
 	fd, err := os.Open(fn)
 	if err != nil {
 		return nil, err
@@ -417,44 +459,72 @@ func (m *IndexPool) ReadMessagesFromFile(fn string, filePos int64, limit int) ([
 	if err != nil {
 		return nil, err
 	}
-	buf := bufio.NewReaderSize(fd, 1024*1024*10)
-	ret := make([]*protocol.MessageConsumer, 0, limit)
-	for i := 0; i < limit; i++ {
+	ret := make([]*protocol.MessageConsumer, 0, endMessagePos-beginMessagePos)
+	for {
 		msg := &protocol.MessageConsumer{}
 		btsMsgNum := make([]byte, 8)
-		_, err = io.ReadFull(buf, btsMsgNum)
+		_, err = fd.Read(btsMsgNum)
 		if err != nil {
-			return ret, err
+			if strings.Contains(err.Error(), "EOF") {
+				return ret, nil
+			} else {
+				return ret, err
+			}
 		}
 		msg.Num = binary.BigEndian.Uint64(btsMsgNum)
 		btsMsgSize := make([]byte, 4)
-		_, err = io.ReadFull(buf, btsMsgSize)
+		_, err = fd.Read(btsMsgSize)
 		if err != nil {
-			return ret, err
+			if strings.Contains(err.Error(), "EOF") {
+				return ret, nil
+			} else {
+				return ret, err
+			}
 		}
 		msg.Size = binary.BigEndian.Uint32(btsMsgSize)
 		if msg.Size < 4 {
 			return ret, protocol.NewError(protocol.ErrorCodeInvalidMessageFile, protocol.ErrorMsgInvalidMessageFile)
 		}
+		if msg.Size > 16*1024*1024 {
+			return ret, protocol.NewError(protocol.ErrCodeMsgSizeTooLarge, protocol.ErrMsgMsgSizeTooLarge)
+		}
 		if msg.Size > 4 {
 			btsData := make([]byte, msg.Size-4)
-			_, err = io.ReadFull(buf, btsData)
+			_, err = fd.Read(btsData)
 			if err != nil {
-				return ret, err
+				if strings.Contains(err.Error(), "EOF") {
+					return ret, nil
+				} else {
+					return ret, err
+				}
 			}
 			msg.Data = btsData
 		}
 		btsCrc := make([]byte, 4)
-		_, err = io.ReadFull(buf, btsCrc)
+		_, err = fd.Read(btsCrc)
 		if err != nil {
-			return ret, err
+			if strings.Contains(err.Error(), "EOF") {
+				return ret, nil
+			} else {
+				return ret, err
+			}
 		}
 		msg.Crc = binary.BigEndian.Uint32(btsCrc)
-		ret = append(ret, msg)
-		bstTailSize := make([]byte, 8)
-		_, err = io.ReadFull(buf, bstTailSize)
+		if msg.Num >= beginMessagePos {
+			if msg.Num < endMessagePos {
+				ret = append(ret, msg)
+			} else {
+				break
+			}
+		}
+		bstTailSize := make([]byte, 4)
+		_, err = fd.Read(bstTailSize)
 		if err != nil {
-			return ret, err
+			if strings.Contains(err.Error(), "EOF") {
+				return ret, nil
+			} else {
+				return ret, err
+			}
 		}
 	}
 
@@ -480,9 +550,7 @@ func (m *IndexPool) Query(q *protocol.MessageQuery) {
 	}
 
 	if b && fn != "" && pos >= 0 {
-		path := m.GetTopicPath(q.Topic)
-		fullFn := filepath.Join(path, fn)
-		msgList, err := m.ReadMessagesFromFile(fullFn, pos, q.Limit)
+		msgList, err := m.ReadMessagesFromFile(fn, pos, q.MessagePos, q.MessagePos+uint64(q.Limit))
 		for _, v := range msgList {
 			q.Result <- &protocol.MessageQueryResult{Message: v, Error: nil}
 		}
